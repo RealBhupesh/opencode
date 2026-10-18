@@ -369,6 +369,7 @@ export function createData(config: CreateDataInput) {
   // failure does not block the next.
   const sending = new Map<string, Promise<unknown>>()
   const messageLoads = new Map<string, Promise<unknown>>()
+  const messageUpdates = new Map<string, Set<string>>()
   const compacting = new Map<string, { id: string; observed: Set<string>; request: Promise<SessionInboxCompaction> }>()
   onCleanup(() => compacting.clear())
 
@@ -427,6 +428,7 @@ export function createData(config: CreateDataInput) {
       const position = index.get(item.id)
       if (position === undefined) return message.append(draft, index, row)
       draft[position] = row
+      return row.id
     })
   }
 
@@ -442,17 +444,25 @@ export function createData(config: CreateDataInput) {
         draft.splice(position, 1)
         index.delete(inboxID)
         message.reindex(draft, index, position)
+        return inboxID
       })
     })
   }
 
   const message = {
-    update(sessionID: string, fn: (messages: SessionMessageInfo[], index: Map<string, number>) => void) {
+    update(
+      sessionID: string,
+      fn: (messages: SessionMessageInfo[], index: Map<string, number>) => string | readonly string[] | undefined,
+    ) {
       setStore(
         "session",
         "message",
         produce((draft) => {
-          fn((draft[sessionID] ??= []), index(sessionID))
+          const changed = fn((draft[sessionID] ??= []), index(sessionID))
+          if (changed === undefined) return
+          const updates = messageUpdates.get(sessionID)
+          if (typeof changed === "string") updates?.add(changed)
+          else changed.forEach((id) => updates?.add(id))
         }),
       )
     },
@@ -460,6 +470,7 @@ export function createData(config: CreateDataInput) {
       if (index.has(item.id)) return
       index.set(item.id, messages.length)
       messages.push(item)
+      return item.id
     },
     insert(sessionID: string, item: SessionMessageInfo) {
       message.update(sessionID, (draft, index) => message.append(draft, index, item))
@@ -470,7 +481,9 @@ export function createData(config: CreateDataInput) {
       message.update(sessionID, (draft, index) => {
         const position = index.get(messageID)
         const item = position === undefined ? undefined : draft[position]
-        if (item?.type === "assistant") fn(item)
+        if (item?.type !== "assistant") return
+        fn(item)
+        return item.id
       })
     },
     editTool(sessionID: string, messageID: string, toolID: string, fn: (tool: SessionMessageAssistantTool) => void) {
@@ -722,6 +735,7 @@ export function createData(config: CreateDataInput) {
                 const position = index.get(item.id)
                 if (position === undefined) return message.append(draft, index, item)
                 draft[position] = item
+                return item.id
               })
             }),
         )
@@ -801,6 +815,7 @@ export function createData(config: CreateDataInput) {
           draft.splice(position, 1)
           draft.push(existing)
           message.reindex(draft, index, position)
+          return existing.id
         })
         compacting.get(event.data.sessionID)?.observed.add(event.data.inboxID)
         return
@@ -876,6 +891,7 @@ export function createData(config: CreateDataInput) {
           match.exit = event.data.shell.exit
           match.output = event.data.output
           match.time.completed = event.created
+          return match.id
         })
         return
       case "session.step.started":
@@ -894,7 +910,7 @@ export function createData(config: CreateDataInput) {
             existing.time.streamed = undefined
             existing.time.completed = undefined
             if (event.data.snapshot) existing.snapshot = { ...existing.snapshot, start: event.data.snapshot }
-            return
+            return existing.id
           }
           const currentAssistant = message.activeAssistant(draft)
           if (currentAssistant) {
@@ -911,6 +927,7 @@ export function createData(config: CreateDataInput) {
             snapshot: event.data.snapshot ? { start: event.data.snapshot } : undefined,
             time: { created: event.data.started },
           })
+          return [event.data.assistantMessageID, ...(currentAssistant ? [currentAssistant.id] : [])]
         })
         return
       case "session.step.streamed":
@@ -1071,7 +1088,9 @@ export function createData(config: CreateDataInput) {
         setSessionActive(event.data.sessionID, "idle")
         message.update(event.data.sessionID, (draft) => {
           const currentAssistant = message.activeAssistant(draft)
-          if (currentAssistant) currentAssistant.retry = undefined
+          if (!currentAssistant) return
+          currentAssistant.retry = undefined
+          return currentAssistant.id
         })
         if (event.type === "session.execution.interrupted" && event.data.reason === "shutdown") return
         // Mirror the projected idle marker so turn boundaries match before the next message read.
@@ -1132,13 +1151,18 @@ export function createData(config: CreateDataInput) {
         message.update(event.data.sessionID, (draft, index) => {
           const position = draft.findIndex((item) => item.id >= event.data.to)
           if (position === -1) return
-          for (const item of draft.splice(position)) index.delete(item.id)
+          return draft.splice(position).map((item) => {
+            index.delete(item.id)
+            return item.id
+          })
         })
         return
       case "session.compaction.delta":
         message.update(event.data.sessionID, (draft) => {
           const current = message.compaction(draft)
-          if (current?.status === "running") current.summary += event.data.text
+          if (current?.status !== "running") return
+          current.summary += event.data.text
+          return current.id
         })
         return
       case "session.compaction.ended":
@@ -1157,9 +1181,9 @@ export function createData(config: CreateDataInput) {
               cost: event.data.cost,
               tokens: event.data.tokens,
             })
-            return
+            return current.id
           }
-          message.append(draft, index, {
+          return message.append(draft, index, {
             id: messageIDFromEvent(event.id),
             type: "compaction",
             status: "completed",
@@ -1196,9 +1220,9 @@ export function createData(config: CreateDataInput) {
           }
           if (current?.type === "compaction") {
             draft[position] = failed
-            return
+            return failed.id
           }
-          message.append(draft, index, failed)
+          return message.append(draft, index, failed)
         })
         if (event.data.inputID) compacting.get(event.data.sessionID)?.observed.add(event.data.inputID)
         return
@@ -1689,29 +1713,40 @@ export function createData(config: CreateDataInput) {
         },
         sync(sessionID: string) {
           return sync.run(`session.message:${sessionID}`, async () => {
-            const response = await api().message.list({
-              sessionID,
-              limit: config.initialMessageLimit?.() ?? messagePageLimit,
-              order: "desc",
-            })
-            const fetched = response.data.toReversed()
-            // Same protection as the pending sync: a re-fetch racing an
-            // admission must not wipe its local transcript row.
-            const ids = new Set(fetched.map((item) => item.id))
-            const admitted = new Set(
-              (store.session.pending[sessionID] ?? []).flatMap((item) =>
-                item.type === "user" || item.type === "synthetic" ? [item.id] : [],
-              ),
-            )
-            const local = (store.session.message[sessionID] ?? []).filter(
-              (item) => !ids.has(item.id) && (outbox.has(item.id) || admitted.has(item.id)),
-            )
-            const messages = local.length === 0 ? fetched : [...fetched, ...local]
-            batch(() => {
-              messageIndex.set(sessionID, new Map(messages.map((message, index) => [message.id, index])))
-              setStore("session", "message", sessionID, reconcile(messages))
-              setStore("session", "messageCursor", sessionID, response.cursor.next ?? undefined)
-            })
+            const updates = new Set<string>()
+            messageUpdates.set(sessionID, updates)
+            try {
+              const response = await api().message.list({
+                sessionID,
+                limit: config.initialMessageLimit?.() ?? messagePageLimit,
+                order: "desc",
+              })
+              // Keep the latest local version of rows changed while the older snapshot was in flight.
+              const fetched = response.data.toReversed().flatMap((item) => {
+                if (!updates.has(item.id)) return [item]
+                const current = result.session.message.get(sessionID, item.id)
+                return current ? [current] : []
+              })
+              // Same protection as the pending sync: a re-fetch racing an
+              // admission must not wipe its local transcript row.
+              const ids = new Set(fetched.map((item) => item.id))
+              const admitted = new Set(
+                (store.session.pending[sessionID] ?? []).flatMap((item) =>
+                  item.type === "user" || item.type === "synthetic" ? [item.id] : [],
+                ),
+              )
+              const local = (store.session.message[sessionID] ?? []).filter(
+                (item) => !ids.has(item.id) && (updates.has(item.id) || outbox.has(item.id) || admitted.has(item.id)),
+              )
+              const messages = local.length === 0 ? fetched : [...fetched, ...local]
+              batch(() => {
+                messageIndex.set(sessionID, new Map(messages.map((message, index) => [message.id, index])))
+                setStore("session", "message", sessionID, reconcile(messages))
+                setStore("session", "messageCursor", sessionID, response.cursor.next ?? undefined)
+              })
+            } finally {
+              if (messageUpdates.get(sessionID) === updates) messageUpdates.delete(sessionID)
+            }
           })
         },
         more(sessionID: string) {

@@ -283,6 +283,11 @@ export function createData(config: CreateDataInput) {
   const sync = createSync()
   let activeUpdates: Map<string, DataSessionStatus | undefined> | undefined
   const pendingUpdates = new Map<string, Map<string, SessionInboxInfo | SessionInbox.Delivery | undefined>>()
+  const formUpdates = new Map<string, Map<string, FormWithLocation | undefined>>()
+
+  function formKey(sessionID: string, ref?: LocationRef) {
+    return `session.form:${sessionID}:${sessionID === "global" ? locationKey(ref ?? defaultLocation()) : ""}`
+  }
 
   function setSessionActive(sessionID: string, status: DataSessionStatus) {
     activeUpdates?.set(sessionID, status)
@@ -313,6 +318,7 @@ export function createData(config: CreateDataInput) {
   }
 
   function removeForm(sessionID: string, formID: string, ref?: LocationRef) {
+    formUpdates.get(formKey(sessionID, ref))?.set(formID, undefined)
     const forms = store.session.form[sessionID]
     if (!forms) return false
     const location = ref && locationKey(ref)
@@ -1281,6 +1287,12 @@ export function createData(config: CreateDataInput) {
         }))
         break
       case "form.created":
+        formUpdates
+          .get(formKey(event.data.form.sessionID, location))
+          ?.set(
+            event.data.form.id,
+            event.data.form.sessionID === "global" ? { ...event.data.form, location } : event.data.form,
+          )
         if (store.session.form[event.data.form.sessionID]?.some((form) => form.id === event.data.form.id)) break
         setStore("session", "form", event.data.form.sessionID, [
           ...(store.session.form[event.data.form.sessionID] ?? []),
@@ -1829,31 +1841,46 @@ export function createData(config: CreateDataInput) {
           )
         },
         sync(sessionID: string, ref?: LocationRef) {
-          const key = `session.form:${sessionID}:${sessionID === "global" ? locationKey(ref ?? defaultLocation()) : ""}`
+          const key = formKey(sessionID, ref)
           return sync.run(key, async () => {
-            if (sessionID === "global") {
-              const response = await api().form.list({
-                location: locationQuery(ref ?? defaultLocation()),
+            const updates = new Map<string, FormWithLocation | undefined>()
+            formUpdates.set(key, updates)
+            // Live creations and settlements received during this read supersede its snapshot.
+            const merge = (forms: FormWithLocation[]) => {
+              const snapshot = new Map(forms.map((form) => [form.id, form]))
+              updates.forEach((form, id) => {
+                if (form === undefined) return snapshot.delete(id)
+                snapshot.set(id, form)
               })
-              const location = {
-                directory: response.location.directory,
-              }
-              const locationID = locationKey(location)
-              setStore("session", "form", sessionID, [
-                ...(store.session.form[sessionID] ?? []).filter(
-                  (form) => form.location && locationKey(form.location) !== locationID,
-                ),
-                ...response.data.filter((form) => form.sessionID === "global").map((form) => ({ ...form, location })),
-              ])
-              return
+              return Array.from(snapshot.values())
             }
-            setStore("session", "form", sessionID, await api().session.form.list({ sessionID }))
+            try {
+              if (sessionID === "global") {
+                const response = await api().form.list({
+                  location: locationQuery(ref ?? defaultLocation()),
+                })
+                const location = {
+                  directory: response.location.directory,
+                }
+                const locationID = locationKey(location)
+                setStore("session", "form", sessionID, [
+                  ...(store.session.form[sessionID] ?? []).filter(
+                    (form) => form.location && locationKey(form.location) !== locationID,
+                  ),
+                  ...merge(
+                    response.data.filter((form) => form.sessionID === "global").map((form) => ({ ...form, location })),
+                  ),
+                ])
+                return
+              }
+              setStore("session", "form", sessionID, merge(await api().session.form.list({ sessionID })))
+            } finally {
+              if (formUpdates.get(key) === updates) formUpdates.delete(key)
+            }
           })
         },
         invalidate(sessionID: string, ref?: LocationRef) {
-          sync.invalidate(
-            `session.form:${sessionID}:${sessionID === "global" ? locationKey(ref ?? defaultLocation()) : ""}`,
-          )
+          sync.invalidate(formKey(sessionID, ref))
         },
         reply(input: SessionFormReplyInput, ref?: LocationRef) {
           return settleForm(input, ref, api().session.form.reply(input, formRequestOptions(input.sessionID, ref)))
